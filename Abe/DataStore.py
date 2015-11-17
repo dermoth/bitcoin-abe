@@ -38,7 +38,7 @@ import util
 import base58
 
 SCHEMA_TYPE = "Abe"
-SCHEMA_VERSION = SCHEMA_TYPE + "40"
+SCHEMA_VERSION = SCHEMA_TYPE + "41"
 
 CONFIG_DEFAULTS = {
     "dbtype":             None,
@@ -735,6 +735,15 @@ store._ddl['configvar'],
     tx_size       NUMERIC(10)
 )""",
 
+# Mempool TX not linked to any block, we must track them somewhere
+# for efficient cleanup
+"""CREATE TABLE unlinked_tx (
+    tx_id        NUMERIC(26) NOT NULL,
+    PRIMARY KEY (tx_id),
+    FOREIGN KEY (tx_id)
+        REFERENCES tx (tx_id)
+)""",
+
 # Presence of transactions in blocks is many-to-many.
 """CREATE TABLE block_tx (
     block_id      NUMERIC(14) NOT NULL,
@@ -1175,6 +1184,7 @@ store._ddl['txout_approx'],
         # List the block's transactions in block_tx.
         for tx_pos in xrange(len(b['transactions'])):
             tx = b['transactions'][tx_pos]
+            store.sql("DELETE FROM unlinked_tx WHERE tx_id = ?", tx['tx_id'])
             store.sql("""
                 INSERT INTO block_tx
                     (block_id, tx_id, tx_pos)
@@ -1800,6 +1810,9 @@ store._ddl['txout_approx'],
             VALUES (?, ?, ?, ?, ?)""",
                   (tx_id, dbhash, store.intin(tx['version']),
                    store.intin(tx['lockTime']), tx['size']))
+        # Always consider tx are unlinked until they are added to block_tx. This is necessary as
+        # inserted tx can get committed to database before the block itself
+        store.sql("INSERT INTO unlinked_tx (tx_id) VALUES (?)", tx_id)
 
         # Import transaction outputs.
         tx['value_out'] = 0

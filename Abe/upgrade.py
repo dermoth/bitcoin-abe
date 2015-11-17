@@ -1056,6 +1056,65 @@ def abstract_sql(store):
              WHERE configvar_name = ?""", ('sql.' + name, name))
     store.commit()
 
+def add_unlinked_tx(store):
+    store.ddl("""
+        CREATE TABLE unlinked_tx (
+            tx_id        NUMERIC(26) NOT NULL,
+            PRIMARY KEY (tx_id),
+            FOREIGN KEY (tx_id)
+                REFERENCES tx (tx_id)
+        )""")
+
+def cleanup_unlinked_tx(store):
+    txcount = 0
+    for tx_id in store.selectall("""
+        SELECT t.tx_id
+            FROM tx t
+            LEFT JOIN block_tx bt ON (t.tx_id = bt.tx_id)
+            WHERE bt.tx_id IS NULL
+        """):
+
+        # Clean up txin's
+        unlinked_txins = store.selectall("""
+            SELECT txin_id FROM txin
+            WHERE tx_id = ?""", tx_id)
+        for txin_id in unlinked_txins:
+            store.sql("DELETE FROM unlinked_txin WHERE txin_id = ?", txin_id)
+        store.sql("DELETE FROM txin WHERE tx_id = ?", tx_id)
+
+        # Clean up txouts & associated pupkeys ...
+        txout_pubkeys = set(store.selectall("""
+            SELECT pubkey_id FROM txout
+            WHERE tx_id = ? AND pubkey_id IS NOT NULL""", tx_id))
+        # Also add multisig pubkeys if any
+        msig_pubkeys = set()
+        for pk_id in txout_pubkeys:
+            msig_pubkeys.update(store.selectall("""
+                SELECT pubkey_id FROM multisig_pubkey
+                WHERE multisig_id = ?""", pk_id))
+
+        store.sql("DELETE FROM txout WHERE tx_id = ?", tx_id)
+
+        # Now delete orphan pubkeys... For simplicity merge both sets together
+        for pk_id in txout_pubkeys.union(msig_pubkeys):
+            (count,) = store.selectrow("""
+                SELECT COUNT(pubkey_id) FROM txout
+                WHERE pubkey_id = ?""", pk_id)
+            if count == 0:
+                store.sql("DELETE FROM multisig_pubkey WHERE multisig_id = ?", pk_id)
+                (count,) = store.selectrow("""
+                    SELECT COUNT(pubkey_id) FROM multisig_pubkey
+                    WHERE pubkey_id = ?""", pk_id)
+                if count == 0:
+                    store.sql("DELETE FROM pubkey WHERE pubkey_id = ?", pk_id)
+
+        # Finally clean up tx itself
+        store.sql("DELETE FROM tx WHERE tx_id = ?", tx_id)
+        txcount += 1
+
+    store.commit()
+    store.log.info("Cleaned up %d unlinked transactions", txcount)
+
 upgrades = [
     ('6',    add_block_value_in),
     ('6.1',  add_block_value_out),
@@ -1156,7 +1215,9 @@ upgrades = [
     ('Abe37.6', populate_multisig_pubkey), # Minutes-hours
     ('Abe38',   abstract_sql),           # Fast
     ('Abe39',   config_concat_style),    # Fast
-    ('Abe40', None)
+    ('Abe40',   add_unlinked_tx),        # Fast
+    ('Abe40.1', cleanup_unlinked_tx),    # Hours, could be done offline
+    ('Abe41', None)
 ]
 
 def upgrade_schema(store):
